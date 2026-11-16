@@ -31,6 +31,9 @@ import com.health.openscale.sync.core.provider.OpenScaleDataProvider
 import com.health.openscale.sync.core.service.BackendRegistry
 import com.health.openscale.sync.core.service.ServiceInterface
 import com.health.openscale.sync.core.service.SyncResult
+import com.health.openscale.sync.core.utils.LogManager
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import timber.log.Timber
 import java.util.concurrent.TimeUnit
 
@@ -51,8 +54,17 @@ class PeriodicSyncWorker(
     params: WorkerParameters
 ) : CoroutineWorker(appContext, params) {
 
-    override suspend fun doWork(): Result {
+    // The backends report their state through LiveData, whose setValue() is main-thread only, and
+    // the other two drivers (SyncService, the activity) run them on the main dispatcher. A
+    // CoroutineWorker starts on Dispatchers.Default, where the first connect() threw "Cannot invoke
+    // setValue on a background thread" and no periodic sync ever got as far as its backend.
+    override suspend fun doWork(): Result = withContext(Dispatchers.Main) { sync() }
+
+    private suspend fun sync(): Result {
         val prefs = applicationContext.getSharedPreferences(OpenScaleViewModel.SETTINGS_FILE, Context.MODE_PRIVATE)
+        // This run may be the only thing alive in the process (no activity, no SyncService), so
+        // nobody else has started the log file yet.
+        LogManager.init(applicationContext, prefs)
         val dataProvider = OpenScaleDataProvider(applicationContext, prefs)
 
         // Version gate: don't act against an incompatible openScale (the UI warns separately).
@@ -84,8 +96,14 @@ class PeriodicSyncWorker(
             var imported = 0
             for (service in enabled.filter { it.importEnabled() }) {
                 val vm = service.viewModel()
-                when (val r = runCatching { service.runInbound(vm.selectedUserId.value) }.getOrNull()) {
-                    is SyncResult.Failure, null -> { anyFailure = true; importFailed += service }
+                val r = runCatching { service.runInbound(vm.selectedUserId.value) }
+                    .getOrElse { SyncResult.Failure(SyncResult.ErrorType.UNKNOWN_ERROR, null, it) }
+                when (r) {
+                    is SyncResult.Failure -> {
+                        anyFailure = true
+                        importFailed += service
+                        Timber.e(r.cause, "%s: import failed in periodic sync (%s)", vm.getName(), r.message ?: r.errorType)
+                    }
                     is SyncResult.Success -> if (r.data.total > 0) {
                         imported += r.data.total
                         Timber.d(
